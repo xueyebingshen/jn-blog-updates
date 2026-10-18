@@ -1,6 +1,17 @@
 name: Publish reviewed blog update
+run-name: reviewed-${{ inputs.request_id }}
 on:
   workflow_dispatch:
+    inputs:
+      version:
+        required: true
+        type: string
+      bundle_sha256:
+        required: true
+        type: string
+      request_id:
+        required: true
+        type: string
 permissions:
   contents: write
   packages: write
@@ -15,19 +26,29 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       GH_REPO: xueyebingshen/jn-blog-updates
-      RELEASE_TAG: v1.0.8
+      VERSION: ${{ inputs.version }}
+      RELEASE_TAG: v${{ inputs.version }}
+      REQUEST_ID: ${{ inputs.request_id }}
       IMAGE: ghcr.io/xueyebingshen/jn-blog
-      BUNDLE_SHA256: 4fe6d642bd1e770ec1ab5cfa284f92a40afe42a0fb9d55b5e72c709359fe0b6e
+      BUNDLE_SHA256: ${{ inputs.bundle_sha256 }}
     steps:
+      - name: Validate dispatch inputs before any download or Docker operation
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$VERSION" =~ ^1\.0\.[1-9][0-9]{0,5}$ ]]
+          [[ "$BUNDLE_SHA256" =~ ^[a-f0-9]{64}$ ]]
+          [[ "$REQUEST_ID" =~ ^[a-f0-9]{32}$ ]]
       - name: Download and verify the reviewed release (no source checkout)
         shell: bash
         run: |
           set -euo pipefail
-          gh release download "$RELEASE_TAG" --repo "$GH_REPO" --pattern 'jn-blog-public-1.0.8.zip' --dir incoming
-          echo "$BUNDLE_SHA256  incoming/jn-blog-public-1.0.8.zip" | sha256sum --check --strict
+          gh release download "$RELEASE_TAG" --repo "$GH_REPO" --pattern "jn-blog-public-${VERSION}.zip" --dir incoming
+          echo "$BUNDLE_SHA256  incoming/jn-blog-public-${VERSION}.zip" | sha256sum --check --strict
           python3 - <<'PY'
+          import os
           import zipfile, pathlib
-          with zipfile.ZipFile('incoming/jn-blog-public-1.0.8.zip') as z:
+          with zipfile.ZipFile('incoming/jn-blog-public-'+os.environ['VERSION']+'.zip') as z:
               names=z.namelist()
               assert len(names)==len(set(names))
               for i in z.infolist():
@@ -38,8 +59,9 @@ jobs:
               z.extractall('reviewed')
           PY
           docker load --input reviewed/image.tar
-          docker image inspect jn-blog-public-review:1.0.8 > loaded-image.json
+          docker image inspect jn-blog-public-review:${VERSION} > loaded-image.json
           python3 - <<'PY'
+          import os
           import json
           actual=json.load(open('loaded-image.json'))[0]
           expected=json.load(open('reviewed/release.json'))
@@ -53,10 +75,11 @@ jobs:
         run: |
           set -euo pipefail
           printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_REPOSITORY_OWNER" --password-stdin
-          TARGET="$IMAGE:1.0.8"
+          TARGET="$IMAGE:${VERSION}"
           # Never replace an existing version. A matching retry is allowed.
           if docker manifest inspect "$TARGET" > existing-manifest.json 2> manifest-error.txt; then
             python3 - <<'PY'
+          import os
           import json
           m=json.load(open('existing-manifest.json'))
           e=json.load(open('reviewed/release.json'))
@@ -65,12 +88,13 @@ jobs:
           else
             # Transport/authentication failure is not proof that the version is absent.
             grep -Eiq 'manifest unknown|no such manifest|name unknown' manifest-error.txt || { cat manifest-error.txt; exit 1; }
-            docker tag jn-blog-public-review:1.0.8 "$TARGET"
+            docker tag jn-blog-public-review:${VERSION} "$TARGET"
             docker push "$TARGET"
           fi
           docker pull "$TARGET"
           docker image inspect "$TARGET" > published-image.json
           python3 - <<'PY'
+          import os
           import json, os, re, pathlib, zipfile, hashlib
           expected=json.load(open('reviewed/release.json'))
           actual=json.load(open('published-image.json'))[0]
@@ -87,7 +111,7 @@ jobs:
                   f.write_text(s.replace(placeholder,refs[0]),encoding='utf-8',newline='\n')
           assert changed==6, 'Expected five program services and release metadata'
           pathlib.Path('out').mkdir()
-          archive=pathlib.Path('out/jn-blog-1panel-1.0.8.zip')
+          archive=pathlib.Path('out/jn-blog-1panel-'+os.environ['VERSION']+'.zip')
           with zipfile.ZipFile(archive,'w',zipfile.ZIP_DEFLATED) as z:
               for f in sorted(template.rglob('*')):
                   if f.is_file(): z.write(f,f.relative_to(template).as_posix())
@@ -97,7 +121,7 @@ jobs:
           with open(os.environ['GITHUB_STEP_SUMMARY'],'a') as summary:
               summary.write('Image published: `'+refs[0]+'`\n\nSet the GHCR package visibility to Public, then verify anonymous pull before installing the 1Panel template. No site data or credentials are needed.\n')
           PY
-          gh release upload "$RELEASE_TAG" --repo "$GH_REPO" out/* --clobber
+          gh release upload "$RELEASE_TAG" --repo "$GH_REPO" out/*
       - name: Log out
         if: always()
         run: docker logout ghcr.io
